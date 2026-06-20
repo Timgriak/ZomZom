@@ -26,13 +26,18 @@ const state = {
   message: "",
   messageTimer: 0,
   gameOver: false,
+  animating: false,
+  animationQueue: [],
   player: {
     x: 3,
     y: 8,
+    drawX: 3,
+    drawY: 8,
     health: 100,
     ap: 2,
     ammo: 24,
     maxAp: 2,
+    maxHealth: 130,
   },
   zombies: [],
   terrain: [],
@@ -66,16 +71,20 @@ function resetGame() {
   state.gameOver = false;
   state.player.x = 3;
   state.player.y = 8;
-  state.player.health = 100;
+  state.player.drawX = 3;
+  state.player.drawY = 8;
+  state.player.health = state.player.maxHealth;
   state.player.ap = 2;
   state.player.ammo = 24;
   state.zombies = [
-    { id: 1, x: 13, y: 3, health: 55, maxMove: 4 },
-    { id: 2, x: 15, y: 8, health: 55, maxMove: 4 },
-    { id: 3, x: 10, y: 11, health: 55, maxMove: 4 },
-    { id: 4, x: 6, y: 2, health: 55, maxMove: 4 },
+    { id: 1, x: 13, y: 3, drawX: 13, drawY: 3, health: 55, maxHealth: 55, maxMove: 2, damage: 14 },
+    { id: 2, x: 15, y: 8, drawX: 15, drawY: 8, health: 90, maxHealth: 90, maxMove: 2, damage: 20, elite: true },
+    { id: 3, x: 10, y: 11, drawX: 10, drawY: 11, health: 55, maxHealth: 55, maxMove: 2, damage: 14 },
+    { id: 4, x: 6, y: 2, drawX: 6, drawY: 2, health: 75, maxHealth: 75, maxMove: 1, damage: 18, elite: true },
   ];
   state.effects = [];
+  state.animationQueue = [];
+  state.animating = false;
   state.terrain = createTerrain();
   showMessage("Player turn: move, shoot, then end turn");
   updateUi();
@@ -209,7 +218,7 @@ function drawTerrain() {
 function drawActors() {
   const actors = [state.player, ...state.zombies].sort((a, b) => a.x + a.y - (b.x + b.y));
   actors.forEach((actor) => {
-    const screen = cellToScreen(actor.x, actor.y);
+    const screen = cellToScreen(actor.drawX ?? actor.x, actor.drawY ?? actor.y);
     const isPlayer = actor === state.player;
 
     ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
@@ -217,13 +226,13 @@ function drawActors() {
     ctx.ellipse(screen.x, screen.y + 9, 17, 8, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.fillStyle = isPlayer ? "#d7c28a" : "#597146";
+    ctx.fillStyle = isPlayer ? "#d7c28a" : actor.elite ? "#7a6548" : "#597146";
     circle(screen.x, screen.y - 14, 15);
     ctx.fillStyle = isPlayer ? "#232018" : "#2d3b25";
     circle(screen.x - 5, screen.y - 19, 3);
     circle(screen.x + 5, screen.y - 19, 3);
 
-    drawHealthBar(screen.x, screen.y - 42, isPlayer ? state.player.health : actor.health, isPlayer ? 100 : 55);
+    drawHealthBar(screen.x, screen.y - 42, isPlayer ? state.player.health : actor.health, isPlayer ? state.player.maxHealth : actor.maxHealth);
 
     if (!isPlayer && hasLineOfSight(state.player, actor)) {
       const chance = getHitChance(actor);
@@ -316,7 +325,9 @@ function getReachableCells() {
     for (let x = 0; x < grid.width; x += 1) {
       const distance = manhattan(state.player, { x, y });
       if (distance <= maxDistance && distance > 0 && !isBlocked(x, y)) {
-        cells.push({ x, y, cost: distance <= 3 ? 1 : 2 });
+        const cost = distance <= 3 ? 1 : 2;
+        const path = findPath(state.player, { x, y }, cost === 1 ? 3 : 5, state.player);
+        if (path.length) cells.push({ x, y, cost });
       }
     }
   }
@@ -324,22 +335,29 @@ function getReachableCells() {
 }
 
 function movePlayer(cell) {
-  if (state.turn !== "player" || state.gameOver) return;
+  if (state.turn !== "player" || state.gameOver || state.animating) return;
   const target = getReachableCells().find((item) => item.x === cell.x && item.y === cell.y);
   if (!target || state.player.ap < target.cost) {
     showMessage("That tile is out of range");
     return;
   }
 
+  const path = findPath(state.player, cell, target.cost === 1 ? 3 : 5, state.player);
+  if (!path.length) {
+    showMessage("No clear path");
+    return;
+  }
+
   state.player.x = cell.x;
   state.player.y = cell.y;
   state.player.ap -= target.cost;
+  queueMovement(state.player, path);
   showMessage(`Moved: ${target.cost} AP`);
   updateUi();
 }
 
 function shootZombie(zombie) {
-  if (state.turn !== "player" || state.gameOver) return;
+  if (state.turn !== "player" || state.gameOver || state.animating) return;
   if (state.player.ap < 1) {
     showMessage("No AP left");
     return;
@@ -415,7 +433,7 @@ function hasLineOfSight(from, to) {
 }
 
 function endPlayerTurn() {
-  if (state.turn !== "player" || state.gameOver) return;
+  if (state.turn !== "player" || state.gameOver || state.animating) return;
   state.turn = "zombie";
   showMessage("Zombie turn");
   updateUi();
@@ -425,20 +443,32 @@ function endPlayerTurn() {
 function runZombieTurn() {
   if (state.gameOver) return;
 
+  const attacks = [];
   state.zombies.forEach((zombie) => {
+    const path = [];
     for (let step = 0; step < zombie.maxMove; step += 1) {
       if (manhattan(zombie, state.player) <= 1) break;
       const next = getZombieStep(zombie);
       if (!next) break;
       zombie.x = next.x;
       zombie.y = next.y;
+      path.push(next);
     }
 
+    if (path.length) queueMovement(zombie, path);
     if (manhattan(zombie, state.player) <= 1) {
-      state.player.health -= 16;
-      const screen = cellToScreen(state.player.x, state.player.y);
-      floatingText("-16", screen.x, screen.y - 45, "#d1513f");
+      attacks.push(zombie);
     }
+  });
+
+  queueAction(() => resolveZombieAttacks(attacks));
+}
+
+function resolveZombieAttacks(attacks) {
+  attacks.forEach((zombie) => {
+    state.player.health -= zombie.damage;
+    const screen = cellToScreen(state.player.drawX, state.player.drawY);
+    floatingText(`-${zombie.damage}`, screen.x, screen.y - 45, "#d1513f");
   });
 
   if (state.player.health <= 0) {
@@ -456,19 +486,23 @@ function runZombieTurn() {
 }
 
 function getZombieStep(zombie) {
-  const options = [
-    { x: zombie.x + 1, y: zombie.y },
-    { x: zombie.x - 1, y: zombie.y },
-    { x: zombie.x, y: zombie.y + 1 },
-    { x: zombie.x, y: zombie.y - 1 },
-  ].filter((cell) => isInside(cell.x, cell.y) && !isBlocked(cell.x, cell.y, zombie));
+  const options = getNeighbors(zombie).filter((cell) => isInside(cell.x, cell.y) && !isBlocked(cell.x, cell.y, zombie));
 
   options.sort((a, b) => manhattan(a, state.player) - manhattan(b, state.player));
   return options[0] || null;
 }
 
+function getNeighbors(cell) {
+  return [
+    { x: cell.x + 1, y: cell.y },
+    { x: cell.x - 1, y: cell.y },
+    { x: cell.x, y: cell.y + 1 },
+    { x: cell.x, y: cell.y - 1 },
+  ];
+}
+
 function handleClick(event) {
-  if (state.turn !== "player" || state.gameOver) return;
+  if (state.turn !== "player" || state.gameOver || state.animating) return;
 
   const cell = screenToCell(event.clientX, event.clientY);
   if (!cell || !isInside(cell.x, cell.y)) return;
@@ -483,10 +517,88 @@ function handleClick(event) {
 }
 
 function updateEffects(delta) {
+  updateMovementAnimation(delta);
   state.effects.forEach((effect) => {
     effect.life -= delta;
   });
   state.effects = state.effects.filter((effect) => effect.life > 0);
+}
+
+function queueMovement(actor, path) {
+  const startX = actor.drawX ?? actor.x;
+  const startY = actor.drawY ?? actor.y;
+  let fromX = startX;
+  let fromY = startY;
+
+  path.forEach((cell) => {
+    state.animationQueue.push({
+      type: "move",
+      actor,
+      fromX,
+      fromY,
+      toX: cell.x,
+      toY: cell.y,
+      elapsed: 0,
+      duration: 0.18,
+    });
+    fromX = cell.x;
+    fromY = cell.y;
+  });
+
+  actor.drawX = startX;
+  actor.drawY = startY;
+}
+
+function queueAction(action) {
+  state.animationQueue.push({ type: "action", action });
+}
+
+function updateMovementAnimation(delta) {
+  const current = state.animationQueue[0];
+  state.animating = Boolean(current);
+  if (!current) return;
+
+  if (current.type === "action") {
+    state.animationQueue.shift();
+    current.action();
+    state.animating = state.animationQueue.length > 0;
+    return;
+  }
+
+  current.elapsed += delta;
+  const progress = clamp(current.elapsed / current.duration, 0, 1);
+  const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+  current.actor.drawX = current.fromX + (current.toX - current.fromX) * eased;
+  current.actor.drawY = current.fromY + (current.toY - current.fromY) * eased;
+
+  if (progress >= 1) {
+    current.actor.drawX = current.toX;
+    current.actor.drawY = current.toY;
+    state.animationQueue.shift();
+  }
+}
+
+function findPath(from, to, maxSteps, actor) {
+  const start = { x: from.x, y: from.y };
+  const queue = [{ ...start, path: [] }];
+  const visited = new Set([`${start.x},${start.y}`]);
+
+  while (queue.length) {
+    const current = queue.shift();
+    if (current.x === to.x && current.y === to.y) return current.path;
+    if (current.path.length >= maxSteps) continue;
+
+    getNeighbors(current)
+      .filter((cell) => isInside(cell.x, cell.y))
+      .filter((cell) => !visited.has(`${cell.x},${cell.y}`))
+      .filter((cell) => !isBlocked(cell.x, cell.y, actor) || (cell.x === to.x && cell.y === to.y))
+      .forEach((cell) => {
+        visited.add(`${cell.x},${cell.y}`);
+        queue.push({ ...cell, path: [...current.path, cell] });
+      });
+  }
+
+  return [];
 }
 
 function updateUi() {
